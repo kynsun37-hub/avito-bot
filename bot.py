@@ -2,6 +2,7 @@ import os
 import asyncio
 import aiohttp
 import re
+import json
 from datetime import datetime
 from aiogram import Bot, types
 from aiogram.dispatcher import Dispatcher
@@ -15,31 +16,35 @@ bot = Bot(token=TOKEN)
 dp = Dispatcher(bot)
 
 # ========== НАСТРОЙКИ (ИЗМЕНИТЕ ПОД СЕБЯ) ==========
-AVITO_SEARCH_URL = "https://www.avito.ru/krasnodar/telefony/mobilnye_telefony/apple-ASgBAgICAkS0wA30qzmwwQ2I_Dc?q=iphone&s=104"
+# ИСПОЛЬЗУЕМ МОБИЛЬНУЮ ВЕРСИЮ АВИТО (она стабильнее для парсинга)
+# Просто добавьте 'm.' перед avito.ru в вашей ссылке
+AVITO_SEARCH_URL = "https://m.avito.ru/krasnodar/telefony/mobilnye_telefony/apple-ASgBAgICAkS0wA30qzmwwQ2I_Dc?q=iphone&s=104"
+
 MY_BUDGET = 50000
-STOP_WORDS = ["скупка", "выкуп", "ремонт", "запчасти", "услуги"]
-MAX_ADS = 10  # Количество объявлений для отправки
+STOP_WORDS = ["скупка", "выкуп", "ремонт", "запчасти", "услуги", "trade-in"]
+MAX_ADS = 10
 
 def is_relevant(text):
-    """Проверяет, не содержит ли объявление мусорных слов"""
     if not text:
         return True
     text_lower = text.lower()
     for word in STOP_WORDS:
-        if word in text_lower:
+        if word.lower() in text_lower:
             return False
     return True
 
 async def fetch_avito():
-    """Загружает страницу Авито"""
+    """Загружает страницу мобильного Авито"""
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Mobile/15E148 Safari/604.1'
     }
     async with aiohttp.ClientSession() as session:
         try:
             async with session.get(AVITO_SEARCH_URL, headers=headers, timeout=30) as resp:
                 if resp.status == 200:
-                    return await resp.text()
+                    html = await resp.text()
+                    print(f"Загружено {len(html)} символов")
+                    return html
                 else:
                     print(f"HTTP ошибка: {resp.status}")
                     return None
@@ -47,68 +52,113 @@ async def fetch_avito():
             print(f"Ошибка соединения: {e}")
             return None
 
-def parse_ads(html):
-    """Извлекает объявления из HTML"""
+def parse_mobile_avito(html):
+    """Парсит мобильную версию Авито"""
     ads = []
     
-    # Поиск всех объявлений через регулярные выражения
-    # Ищем блоки с data-marker="item"
-    item_pattern = r'data-marker="item"[^>]*>.*?</div></div></div></div>'
-    items = re.findall(item_pattern, html, re.DOTALL)
+    # Метод 1: Ищем JSON-данные в скриптах
+    json_pattern = r'<script type="application/ld\+json">(.*?)</script>'
+    json_matches = re.findall(json_pattern, html, re.DOTALL)
     
-    # Альтернативный метод через JSON-данные на странице
-    # Ищем window._initialState
-    json_match = re.search(r'window\._initialState\s*=\s*({.*?});', html, re.DOTALL)
-    
-    if json_match:
+    for match in json_matches:
         try:
-            import json
-            data = json.loads(json_match.group(1))
-            # Пытаемся найти items в структуре
-            items_data = data.get('catalog', {}).get('items', [])
-            for item in items_data[:MAX_ADS]:
-                ad = {
-                    'id': str(item.get('id', '')),
-                    'title': item.get('title', 'Без названия'),
-                    'price': item.get('price', {}).get('value', 0),
-                    'url': f"https://www.avito.ru{item.get('urlPath', '')}",
-                    'photo': item.get('images', [{}])[0].get('url', '') if item.get('images') else '',
-                }
-                ads.append(ad)
+            data = json.loads(match)
+            if isinstance(data, dict) and 'itemListElement' in data:
+                for item in data['itemListElement']:
+                    if 'item' in item:
+                        item_data = item['item']
+                        ad = {
+                            'id': str(item_data.get('@id', '').split('/')[-1] if item_data.get('@id') else ''),
+                            'title': item_data.get('name', 'Без названия'),
+                            'price': int(item_data.get('price', '0')) if item_data.get('price') else 0,
+                            'url': item_data.get('url', ''),
+                            'photo': item_data.get('image', '')
+                        }
+                        if ad['id'] and ad['price'] > 0:
+                            ads.append(ad)
         except:
             pass
     
-    # Если JSON-метод не сработал, используем старый метод с regex
+    # Метод 2: Если JSON не сработал, ищем блоки объявлений
     if not ads:
-        id_matches = re.findall(r'"id"\s*:\s*"(\d+)"', html)
-        title_matches = re.findall(r'"title"\s*:\s*"([^"]+)"', html)
-        price_matches = re.findall(r'"price"\s*:\s*"(\d+)"', html)
-        url_matches = re.findall(r'"urlPath"\s*:\s*"([^"]+)"', html)
+        # Ищем блоки с классом item
+        item_pattern = r'<div class="item[^"]*"[^>]*>.*?<a href="([^"]+)".*?<h3[^>]*>(.*?)</h3>.*?<span class="price">([^<]+)</span>'
+        matches = re.findall(item_pattern, html, re.DOTALL)
         
-        for i in range(min(len(id_matches), MAX_ADS * 2)):  # Берем с запасом
-            if i < len(title_matches) and i < len(price_matches):
-                ad = {
-                    'id': id_matches[i],
-                    'title': title_matches[i].replace('\\u0026', '&').replace('\\u0022', '"'),
-                    'price': int(price_matches[i]) if price_matches[i].isdigit() else 0,
-                    'url': f"https://www.avito.ru{url_matches[i]}" if i < len(url_matches) else "",
-                    'photo': '',
-                }
-                ads.append(ad)
+        for match in matches[:MAX_ADS]:
+            url = match[0] if match[0].startswith('http') else f"https://m.avito.ru{match[0]}"
+            title = match[1].strip()
+            price_text = match[2].strip()
+            
+            # Извлекаем цифры из цены
+            price_numbers = re.findall(r'\d+', price_text)
+            price = int(''.join(price_numbers)) if price_numbers else 0
+            
+            ad_id = url.split('/')[-1] if url else str(hash(url))
+            
+            ads.append({
+                'id': ad_id,
+                'title': title,
+                'price': price,
+                'url': url,
+                'photo': ''
+            })
     
-    return ads
+    # Метод 3: Самый простой — ищем через data-marker
+    if not ads:
+        marker_pattern = r'data-marker="item(?:/title)?"[^>]*>\s*<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>'
+        matches = re.findall(marker_pattern, html, re.DOTALL)
+        
+        for match in matches[:MAX_ADS]:
+            url = match[0] if match[0].startswith('http') else f"https://m.avito.ru{match[0]}"
+            title = re.sub(r'<[^>]+>', '', match[1]).strip()
+            
+            # Ищем цену отдельно
+            price_pattern = r'<span[^>]*data-marker="item-price"[^>]*>([^<]+)</span>'
+            price_match = re.search(price_pattern, html)
+            price = 0
+            if price_match:
+                price_text = price_match.group(1)
+                price_numbers = re.findall(r'\d+', price_text)
+                price = int(''.join(price_numbers)) if price_numbers else 0
+            
+            ad_id = url.split('/')[-1] if url else str(hash(url))
+            
+            ads.append({
+                'id': ad_id,
+                'title': title,
+                'price': price,
+                'url': url,
+                'photo': ''
+            })
+    
+    # Убираем дубликаты по ID
+    unique_ads = []
+    seen_ids = set()
+    for ad in ads:
+        if ad['id'] not in seen_ids:
+            seen_ids.add(ad['id'])
+            unique_ads.append(ad)
+    
+    return unique_ads
 
 async def get_top_ads():
-    """Получает топ N объявлений без фильтрации по новизне"""
-    print(f"[{datetime.now()}] Запрос к Авито...")
+    """Получает топ объявлений"""
+    print(f"[{datetime.now()}] Запрос к мобильному Авито...")
     
     html = await fetch_avito()
     if not html:
-        return None, "❌ Не удалось загрузить Авито. Возможно, сайт временно недоступен."
+        return None, "❌ Не удалось загрузить Авито. Проверьте интернет или повторите позже."
     
-    all_ads = parse_ads(html)
+    all_ads = parse_mobile_avito(html)
+    
     if not all_ads:
-        return None, "❌ Не найдено объявлений по вашему запросу."
+        # Сохраним HTML для отладки (первые 500 символов)
+        debug_info = html[:500] if html else "пусто"
+        print(f"Не удалось найти объявления. HTML: {debug_info}")
+        return None, "❌ Не найдено объявлений. Возможно, сайт изменил структуру."
+    
+    print(f"Найдено объявлений: {len(all_ads)}")
     
     # Фильтруем по бюджету и стоп-словам
     filtered_ads = []
@@ -116,8 +166,10 @@ async def get_top_ads():
         if ad['price'] <= MY_BUDGET and is_relevant(ad['title']):
             filtered_ads.append(ad)
     
+    print(f"После фильтрации: {len(filtered_ads)} (бюджет {MY_BUDGET})")
+    
     if not filtered_ads:
-        return None, f"❌ Нет объявлений в пределах бюджета ({MY_BUDGET:,} руб.)"
+        return None, f"❌ Нет объявлений в пределах вашего бюджета ({MY_BUDGET:,} руб.).\n\n💡 Совет: увеличьте бюджет или измените поисковый запрос."
     
     # Берём первые MAX_ADS
     top_ads = filtered_ads[:MAX_ADS]
@@ -125,7 +177,7 @@ async def get_top_ads():
     return top_ads, None
 
 def format_ads_message(ads):
-    """Форматирует объявления в одно сообщение"""
+    """Форматирует объявления"""
     if not ads:
         return "❌ Объявления не найдены"
     
@@ -133,44 +185,27 @@ def format_ads_message(ads):
     message += f"📅 {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}\n"
     message += f"💰 Бюджет: {MY_BUDGET:,} руб\n"
     message += f"📊 Найдено подходящих: {len(ads)}\n"
-    message += f"─" * 30 + "\n\n"
+    message += f"─" * 35 + "\n\n"
     
     for i, ad in enumerate(ads, 1):
-        # Обрезаем слишком длинные заголовки
-        title = ad['title'][:70] + "..." if len(ad['title']) > 70 else ad['title']
+        title = ad['title'][:60] + "..." if len(ad['title']) > 60 else ad['title']
         
         message += f"<b>{i}. {title}</b>\n"
         message += f"💰 {ad['price']:,} руб\n"
         message += f"🔗 <a href='{ad['url']}'>Открыть объявление</a>\n\n"
     
-    message += f"─" * 30 + "\n"
-    message += f"🔄 Чтобы обновить, снова отправьте /check"
+    message += f"─" * 35 + "\n"
+    message += f"🔄 Для обновления отправьте /check"
     
     return message
 
 async def send_ads_to_telegram(ads):
-    """Отправляет объявления в Telegram (одним сообщением)"""
     if not ads:
         return
     
     message = format_ads_message(ads)
     
     try:
-        # Пробуем отправить с фото первого объявления (если есть)
-        first_ad = ads[0]
-        if first_ad.get('photo'):
-            try:
-                await bot.send_photo(
-                    CHAT_ID,
-                    photo=first_ad['photo'],
-                    caption=message,
-                    parse_mode=ParseMode.HTML
-                )
-                return
-            except:
-                pass  # Если фото не отправилось, шлём обычное сообщение
-        
-        # Обычное сообщение без фото
         await bot.send_message(
             CHAT_ID,
             message,
@@ -189,9 +224,9 @@ async def start(message: types.Message):
         f"✅ Бот готов к работе\n"
         f"💰 Бюджет: {MY_BUDGET:,} руб\n"
         f"📦 Показываю до {MAX_ADS} объявлений за раз\n"
-        f"🔍 Поиск: {AVITO_SEARCH_URL.split('?')[0][:50]}...\n\n"
+        f"🔍 Поиск: мобильная версия Авито\n\n"
         f"📌 <b>Команды:</b>\n"
-        f"/check — показать последние {MAX_ADS} объявлений\n"
+        f"/check — найти объявления\n"
         f"/status — показать настройки\n"
         f"/search — показать ссылку поиска\n"
         f"/help — помощь",
@@ -200,21 +235,17 @@ async def start(message: types.Message):
 
 @dp.message_handler(commands=['check'])
 async def check_command(message: types.Message):
-    # Отправляем сообщение о начале проверки
     status_msg = await message.reply("🔍 Поиск объявлений на Авито... ⏳")
     
-    # Получаем объявления
     ads, error = await get_top_ads()
     
     if error:
         await status_msg.edit_text(error)
         return
     
-    # Удаляем сообщение "Поиск..." и отправляем результат
     await status_msg.delete()
     await send_ads_to_telegram(ads)
     
-    # Логируем в консоль
     print(f"Отправлено {len(ads)} объявлений")
 
 @dp.message_handler(commands=['status'])
@@ -225,7 +256,7 @@ async def status_command(message: types.Message):
         f"💰 Бюджет: {MY_BUDGET:,} руб\n"
         f"📦 Показываю: до {MAX_ADS} объявлений\n"
         f"🚫 Стоп-слова: {', '.join(STOP_WORDS)}\n"
-        f"🔗 Ссылка: {AVITO_SEARCH_URL[:60]}...\n\n"
+        f"🔗 Ссылка: {AVITO_SEARCH_URL[:70]}...\n\n"
         f"🔄 Используйте /check для поиска",
         parse_mode=ParseMode.HTML
     )
@@ -233,9 +264,13 @@ async def status_command(message: types.Message):
 @dp.message_handler(commands=['search'])
 async def search_command(message: types.Message):
     await message.reply(
-        f"🔗 <b>Ваша ссылка поиска на Авито:</b>\n\n"
+        f"🔗 <b>Ваша ссылка поиска (мобильная версия):</b>\n\n"
         f"<code>{AVITO_SEARCH_URL}</code>\n\n"
-        f"📌 Скопируйте её и вставьте в браузер",
+        f"📌 <b>Как обновить ссылку?</b>\n"
+        f"1. Откройте m.avito.ru в браузере\n"
+        f"2. Найдите нужные товары\n"
+        f"3. Скопируйте URL\n"
+        f"4. Замените AVITO_SEARCH_URL в коде на GitHub",
         parse_mode=ParseMode.HTML
     )
 
@@ -244,32 +279,28 @@ async def help_command(message: types.Message):
     await message.reply(
         f"📖 <b>Помощь</b>\n\n"
         f"⚙️ <b>Как работает бот:</b>\n"
-        f"1. Вы отправляете /check\n"
-        f"2. Бот парсит Авито по вашей ссылке\n"
-        f"3. Отсеивает объявления дороже {MY_BUDGET:,} руб\n"
-        f"4. Отсеивает объявления со стоп-словами\n"
-        f"5. Показывает до {MAX_ADS} самых свежих\n\n"
+        f"1. Использует <b>мобильную версию</b> Авито (стабильнее)\n"
+        f"2. Парсит до {MAX_ADS} объявлений\n"
+        f"3. Отсеивает: дороже {MY_BUDGET:,} руб + стоп-слова\n\n"
         f"✏️ <b>Как изменить настройки:</b>\n"
-        f"1. Откройте код на GitHub\n"
-        f"2. Найдите переменные в начале файла:\n"
-        f"   - AVITO_SEARCH_URL (ваша ссылка)\n"
-        f"   - MY_BUDGET (бюджет)\n"
-        f"   - STOP_WORDS (стоп-слова)\n"
-        f"   - MAX_ADS (количество объявлений)\n"
-        f"3. Сохраните изменения\n"
-        f"4. Бот перезапустится автоматически\n\n"
-        f"❓ Вопросы? Пишите @kynsun37",
+        f"• Откройте код на GitHub\n"
+        f"• Найдите переменные в начале файла\n"
+        f"• Сохраните — бот перезапустится\n\n"
+        f"❓ Не нашли объявления?\n"
+        f"• Проверьте ссылку через /search\n"
+        f"• Увеличьте бюджет /status\n"
+        f"• Уберите стоп-слова из кода",
         parse_mode=ParseMode.HTML
     )
 
 if __name__ == '__main__':
     print("=" * 50)
     print("🤖 Бот запущен!")
-    print(f"🔍 Поиск: {AVITO_SEARCH_URL[:70]}...")
+    print(f"🔍 Поиск (моб.версия): {AVITO_SEARCH_URL[:80]}...")
     print(f"💰 Бюджет: {MY_BUDGET} руб")
     print(f"📦 Максимум объявлений: {MAX_ADS}")
     print("=" * 50)
-    print("✅ Бот готов к работе. Отправьте /check в Telegram")
+    print("✅ Отправьте /check в Telegram")
     print("=" * 50)
     
     executor.start_polling(dp)
